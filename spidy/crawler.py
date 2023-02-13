@@ -356,7 +356,7 @@ def crawl_worker(thread_id, robots_index):
                             WORDS.clear()
                 # TODO: stop here for develop usage
                 # remove in future
-                done_crawling(True)
+                # done_crawling(True)
 
             # Crawl the page
             else:
