@@ -3,17 +3,18 @@
 spidy Web Crawler
 Built by rivermont and FalconWarriorr
 """
-import os
-import time
-import shutil
-import requests
-import urllib
-import threading
-import queue
+import argparse
 import logging
-
-from os import path, makedirs
+import queue
+import re
+import shutil
+import threading
+import time
+import urllib
 from copy import copy
+from os import path, makedirs
+
+import requests
 from lxml import etree
 from lxml.html import iterlinks, resolve_base_href, make_links_absolute
 from reppy.robots import Robots
@@ -22,45 +23,6 @@ try:
     from spidy import __version__
 except ImportError:
     from __init__ import __version__
-
-# # Integrate selenium
-# from multiprocessing import Process, Lock
-# from selenium import webdriver
-# from selenium.webdriver import DesiredCapabilities
-# from selenium.webdriver.common.by import By
-# from selenium.webdriver.support import expected_conditions as EC
-# from selenium.webdriver.support.ui import WebDriverWait
-# from selenium.webdriver.common.action_chains import ActionChains
-# from urllib.parse import urlparse
-#
-# time.sleep(15)
-# options = webdriver.ChromeOptions()
-# options.add_argument("--headless")
-# options.add_argument("--log-level=3")
-# options.add_experimental_option('excludeSwitches', ['enable-logging'])
-# browser = webdriver.Remote("http://selenium:4444/wd/hub", options=options)
-#
-# browser_lock = Lock()
-#
-#
-# def get_page(url: str) -> str:
-#     wait = 0.5
-#     with browser_lock:
-#         browser.get(url)
-#         time.sleep(wait)
-#         source = browser.page_source
-#
-#         # responses = []
-#         # for request in browser.requests:
-#         #     if request.response and urlparse(url).netloc not in urlparse(request.url).netloc:
-#         #         responses.append(request.response)
-#
-#         if len(browser.window_handles) >= 2:
-#             print(browser.window_handles, len(browser.window_handles))
-#             browser.close()
-#
-#     return source
-
 
 VERSION = __version__
 
@@ -114,6 +76,25 @@ handler.setFormatter(formatter)
 LOGGER.addHandler(handler)
 
 log_mutex = threading.Lock()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Spidy Script.")
+    parser.add_argument(
+        "--config_name",
+        type=str,
+        help="Init crawler using *.cfg file, should be the file name in ./spidy/config folder EX: vogue")
+    args = parser.parse_args()
+    return args
+
+
+class TimeoutException(Exception):
+    pass
+
+
+def timeout_handler(signum, frame):
+    print("Handle Timeout")
+    raise TimeoutException()
 
 
 def write_log(operation, message, package='spidy', status='INFO', worker=0):
@@ -199,6 +180,7 @@ class ThreadSafeSet(list):
     """
 
     def __init__(self):
+        super().__init__()
         self.lock = threading.Lock()
         self._set = set()
 
@@ -223,6 +205,7 @@ class RobotsIndex(object):
     """
     Thread Safe Robots Index
     """
+
     def __init__(self, respect_robots, user_agent):
         self.respect_robots = respect_robots
         self.user_agent = user_agent
@@ -277,7 +260,7 @@ def crawl(url, thread_id=0):
             raise SizeError
     # If the SizeError is raised it will be caught in the except block in the run section,
     # and the following code will not be run.
-    page = requests.get(url, headers=HEADER)  # Get page
+    page = requests.get(url, headers=HEADER, timeout=5)  # Get page
     word_list = []
     doctype = get_mime_type(page)
     if doctype.find('image') < 0 and doctype.find('video') < 0:
@@ -286,12 +269,18 @@ def crawl(url, thread_id=0):
             for word in word_list:
                 WORDS.put(word)
         try:
+            # signal.signal(signal.SIGALRM, timeout_handler)
+            # signal.alarm(TIMEOUT)
+
             # Pull out all links after resolving them using any <base> tags found in the document.
             links = [link for element, attribute, link, pos
                      in iterlinks(resolve_base_href(make_links_absolute(page.content, url)))]
         except etree.ParseError:
             # If the document is not HTML content this will return an empty list.
             links = []
+        # except TimeoutException:
+        #     links = []
+
         links = list(set(links))
     else:
         links = []
@@ -367,7 +356,7 @@ def crawl_worker(thread_id, robots_index):
                             WORDS.clear()
                 # TODO: stop here for develop usage
                 # remove in future
-                # done_crawling(True)
+                done_crawling(True)
 
             # Crawl the page
             else:
@@ -474,11 +463,22 @@ def check_link(item, robots_index=None):
     if robots_index and not robots_index.is_allowed(item):
         return True
     if RESTRICT:
+        if REGEX_PATTERN is not None:
+            # result = re.match(REGEX_PATTERN, item, flags=re.IGNORECASE)
+            result = re.match(REGEX_PATTERN, item)
+            if result is not None:
+                # valid url
+                return False
+            else:
+                # print(f"Invalid URL {item}")
+                return True
+
         if DOMAIN not in item:
             return True
+
     if len(item) < 10 or len(item) > 255:
         return True
-    # Must be an http(s) link
+    # Must be a http(s) link
     elif item[0:4] != 'http':
         return True
     elif item in copy(DONE.queue):
@@ -682,8 +682,8 @@ def zip_saved_files(out_file_name, directory):
     # shutil.make_archive(str(out_file_name), 'zip', directory)  # Zips files
     try:
         # TODO: add sub directory
-        shutil.make_archive(f"./data/{str(out_file_name)}", 'zip', directory)  # Zips files
-        write_log('SAVE', f'save archived to /data')  # check
+        shutil.make_archive(f"./data/{CONFIG_NAME}/{str(out_file_name)}", 'zip', directory)  # Zips files
+        write_log('SAVE', f'save archived to ./data/{CONFIG_NAME}/{str(out_file_name)}')  # check
     except Exception as e:
         write_log('SAVE', f"Error {e}")
 
@@ -885,11 +885,14 @@ THREAD_LIST = []
 save_mutex = threading.Lock()
 FINISHED = False
 THREAD_RUNNING = True
+REGEX_PATTERN = None
+TIMEOUT = 100
+CONFIG_NAME = None
 
 
-def init():
+def init(config_name=None):
     """
-    Sets all of the variables for spidy,
+    Sets all the variables for spidy,
     and as a result can be used for effectively resetting the crawler.
     """
     # Declare global variables
@@ -902,12 +905,16 @@ def init():
     global TODO_FILE, DONE_FILE, ERR_LOG_FILE, WORD_FILE
     global RESPECT_ROBOTS, RESTRICT, DOMAIN
     global WORDS, TODO, DONE, THREAD_COUNT
+    global REGEX_PATTERN, TIMEOUT, CONFIG_NAME
 
     # Getting Arguments
 
     if not path.exists(path.join(PACKAGE_DIR, 'config')):
         write_log('INIT', 'No config folder available.')
         USE_CONFIG = False
+    # Load config file through argument
+    elif config_name:
+        pass
     else:
         write_log('INIT', 'Should spidy load settings from an available config file? (y/n):', status='INPUT')
         while True:
@@ -924,15 +931,32 @@ def init():
             else:
                 handle_invalid_input()
 
-    if USE_CONFIG:
+    # Load config file through argument
+    # if config_name:
+    #     file_path = path.join(PACKAGE_DIR, 'config', '{0}.cfg'.format(config_name))
+    #     CONFIG_NAME = config_name
+    #     write_log('INIT', 'Loading configuration settings from give argument: {0}'.format(file_path))
+    #     with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+    #         for line in file.readlines():
+    #             exec(line, globals())
+    if config_name:
+        file_path = path.join(PACKAGE_DIR, 'config', '{0}.cfg'.format(config_name))
+        CONFIG_NAME = config_name
+        write_log('INIT', 'Loading configuration settings from give argument: {0}'.format(file_path))
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+            for line in file.readlines():
+                exec(line, globals())
+    elif USE_CONFIG:
         write_log('INIT', 'Config file name:', status='INPUT')
         while True:
             input_ = input()
             try:
                 if input_[-4:] == '.cfg':
                     file_path = path.join(PACKAGE_DIR, 'config', input_)
+                    CONFIG_NAME = input_[:-4]
                 else:
                     file_path = path.join(PACKAGE_DIR, 'config', '{0}.cfg'.format(input_))
+                    CONFIG_NAME = input_
                 write_log('INIT', 'Loading configuration settings from {0}'.format(file_path))
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
                     for line in file.readlines():
@@ -943,7 +967,6 @@ def init():
                 # raise FileNotFoundError()
 
             write_log('INIT', 'Please name a valid .cfg file.')
-
     else:
         write_log('INIT', 'Please enter the following arguments. Leave blank to use the default values.')
 
@@ -1286,7 +1309,7 @@ def handle_keyboard_interrupt():
     done_crawling(True)
 
 
-def main():
+def main(args):
     """
     The main function of spidy.
     """
@@ -1302,11 +1325,11 @@ def main():
     global WORDS, TODO, DONE
 
     try:
-        init()
+        init(args.config_name)
     except KeyboardInterrupt:
         handle_keyboard_interrupt()
 
-    # Create required saved/ folder
+    # Create required ./saved/ folder
     try:
         makedirs('saved')
     except OSError:
@@ -1328,7 +1351,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    arg = parse_args()
+    # print(arg.config_file)
+    main(arg)
 else:
     write_log('INIT', f'Successfully imported spidy Web Crawler version {VERSION}.')
     write_log('INIT',
