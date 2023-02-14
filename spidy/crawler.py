@@ -13,8 +13,11 @@ import time
 import urllib
 from copy import copy
 from os import path, makedirs
+from multiprocessing import Lock
+
 
 import requests
+from selenium import webdriver
 from lxml import etree
 from lxml.html import iterlinks, resolve_base_href, make_links_absolute
 from reppy.robots import Robots
@@ -76,6 +79,8 @@ handler.setFormatter(formatter)
 LOGGER.addHandler(handler)
 
 log_mutex = threading.Lock()
+
+browser_lock = Lock()
 
 
 def parse_args():
@@ -248,6 +253,9 @@ class RobotsIndex(object):
 write_log('INIT', 'Creating functions...')
 
 
+# ********************************************
+# * Default: using standard requests library *
+# ********************************************
 def crawl(url, thread_id=0):
     global WORDS, OVERRIDE_SIZE, HEADER, SAVE_PAGES, SAVE_WORDS
     if not OVERRIDE_SIZE:
@@ -280,7 +288,6 @@ def crawl(url, thread_id=0):
             links = []
         # except TimeoutException:
         #     links = []
-
         links = list(set(links))
     else:
         links = []
@@ -293,6 +300,66 @@ def crawl(url, thread_id=0):
     else:
         # Announce which link was crawled
         write_log('CRAWL', f'Found {len(links)} links on {url}', worker=thread_id)
+    return links
+
+
+# ********************************************
+# * Default: using standard requests library *
+# ********************************************
+def get_page(browser, url: str, wait: int = 0) -> str:
+    with browser_lock:
+        browser.get(url)
+        time.sleep(wait)
+        source = browser.page_source
+        if len(browser.window_handles) >= 2:
+            print(browser.window_handles, len(browser.window_handles))
+            browser.close()
+    return source
+#     return """<!DOCTYPE html>
+# <html>
+# <body>
+#
+# <h2 title="I'm a header">The title Attribute</h2>
+#
+# <p title="I'm a tooltip">Mouse over this paragraph, to display the title attribute as a tooltip.</p>
+#
+# </body>
+# </html>"""
+
+
+def save_page_selenium(url, page_text):
+    """
+    Save content of url and save to the save folder.
+    """
+    # Make file path
+    ext = ".html"
+    cropped_url = make_file_path(url, ext)
+    file_path = path.join(WORKING_DIR, 'saved', cropped_url)
+
+    # Save file
+    with open(file_path, 'w', encoding='utf-8', errors='ignore') as file:
+        if ext == '.html':
+            file.write(f'''<!-- "{url}" -->
+<!-- Downloaded with the spidy Web Crawler Selenium -->
+<!-- https://github.com/m1stborn/spidy -->
+''')
+        file.write(page_text)
+
+
+def crawl_with_selenium(url, browser, thread_id=0):
+    global WORDS, OVERRIDE_SIZE, HEADER, SAVE_PAGES, SAVE_WORDS
+    page_text = get_page(browser, url, wait=2)
+    try:
+        # Pull out all links after resolving them using any <base> tags found in the document.
+        links = [link for element, attribute, link, pos
+                 in iterlinks(resolve_base_href(make_links_absolute(page_text, url)))]
+    except etree.ParseError:
+        links = []
+    links = list(set(links))
+
+    if SAVE_PAGES:
+        save_page_selenium(url, page_text)
+    write_log('CRAWL', f'Found {len(links)} links on {url} (Selenium)', worker=thread_id)
     return links
 
 
@@ -311,6 +378,14 @@ def crawl_worker(thread_id, robots_index):
     global TODO_FILE, DONE_FILE, ERR_LOG_FILE, WORD_FILE
     global RESPECT_ROBOTS, RESTRICT, DOMAIN
     global WORDS, TODO, DONE, THREAD_RUNNING
+
+    browser = None
+    if DYNAMIC_LOAD:
+        options = webdriver.ChromeOptions()
+        options.add_argument("--headless")
+        options.add_argument("--log-level=3")
+        options.add_experimental_option('excludeSwitches', ['enable-logging'])
+        browser = webdriver.Remote(SELENIUM_URL, options=options)
 
     while THREAD_RUNNING:
         # Check if there are more urls to crawl
@@ -367,7 +442,13 @@ def crawl_worker(thread_id, robots_index):
                 else:
                     if check_link(url, robots_index):  # If the link is invalid
                         continue
-                    links = crawl(url, thread_id)
+
+                    if DYNAMIC_LOAD:
+                        links = crawl_with_selenium(url, browser, thread_id)
+                        # print("selenium link", links[:1])
+                    else:
+                        links = crawl(url, thread_id)
+
                     for link in links:
                         # Skip empty links
                         if len(link) <= 0 or link == "/":
@@ -888,6 +969,8 @@ THREAD_RUNNING = True
 REGEX_PATTERN = None
 TIMEOUT = 100
 CONFIG_NAME = None
+DYNAMIC_LOAD = False
+SELENIUM_URL = None
 
 
 def init(config_name=None):
@@ -905,7 +988,7 @@ def init(config_name=None):
     global TODO_FILE, DONE_FILE, ERR_LOG_FILE, WORD_FILE
     global RESPECT_ROBOTS, RESTRICT, DOMAIN
     global WORDS, TODO, DONE, THREAD_COUNT
-    global REGEX_PATTERN, TIMEOUT, CONFIG_NAME
+    global REGEX_PATTERN, TIMEOUT, CONFIG_NAME, DYNAMIC_LOAD, SELENIUM_URL
 
     # Getting Arguments
 
